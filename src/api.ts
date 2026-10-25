@@ -13,27 +13,29 @@ export async function searchPlace(q: string): Promise<(LatLng & { label: string 
 
 export type Box = { minLat: number; maxLat: number; minLng: number; maxLng: number }
 
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+// OSM keys that are never "places to go" — used to clean up free-text searches.
+const NOT_PLACES = new Set(['highway', 'landuse', 'building', 'place', 'boundary', 'route', 'railway', 'waterway', 'natural'])
 
-/** Named places of one category inside `box` (OpenStreetMap data via Nominatim; polite 1 request/second). */
-export async function findPlaces(box: Box, cat: Cat, signal?: AbortSignal): Promise<Place[]> {
+/** Named places for an activity inside `box`, biased towards `centre` (OpenStreetMap data via Photon). */
+export async function findPlaces(box: Box, centre: LatLng, cat: Cat, signal?: AbortSignal): Promise<Place[]> {
+  const runs = await Promise.all(
+    cat.queries.map(async ({ q, tag }) => {
+      const url =
+        `https://photon.komoot.io/api/?limit=40&lang=en&bbox=${box.minLng},${box.minLat},${box.maxLng},${box.maxLat}` +
+        `&lat=${centre.lat}&lon=${centre.lng}&q=${encodeURIComponent(q)}${tag ? `&osm_tag=${encodeURIComponent(tag)}` : ''}`
+      const r = await fetch(url, { signal })
+      if (!r.ok) throw new Error('Place lookup failed')
+      return ((await r.json()).features ?? []) as any[]
+    }),
+  )
   const out = new Map<string, Place>()
-  for (let i = 0; i < cat.terms.length; i++) {
-    if (i) await sleep(1100)
-    const url =
-      'https://nominatim.openstreetmap.org/search?format=jsonv2&limit=40&bounded=1&addressdetails=0' +
-      `&viewbox=${box.minLng},${box.maxLat},${box.maxLng},${box.minLat}&q=${encodeURIComponent(cat.terms[i])}`
-    const r = await fetch(url, { signal })
-    if (!r.ok) throw new Error('Place lookup failed')
-    for (const x of (await r.json()) as any[]) {
-      if (!cat.types.includes(`${x.category}:${x.type}`)) continue
-      const id = `${x.osm_type}${x.osm_id}`
-      out.set(id, {
-        id, lat: +x.lat, lng: +x.lon,
-        name: (x.name || x.display_name.split(',')[0]) as string,
-        sub: (x.type as string).replace(/_/g, ' ').replace(/^./, c => c.toUpperCase()),
-      })
-    }
+  for (const f of runs.flat()) {
+    const p = f.properties
+    if (!p.name || (!cat.queries[0].tag && NOT_PLACES.has(p.osm_key))) continue
+    const id = `${p.osm_type}${p.osm_id}`
+    const kind = ((p.osm_value as string) || cat.label).replace(/_/g, ' ').replace(/^./, ch => ch.toUpperCase())
+    const area = p.district || p.suburb || p.city
+    out.set(id, { id, lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0], name: p.name as string, sub: area ? `${kind} · ${area}` : kind })
   }
   return [...out.values()]
 }
@@ -66,21 +68,37 @@ export async function getTimes(people: LatLng[], places: LatLng[]): Promise<(num
 
 export type Suggestion = LatLng & { id: string; title: string; subtitle: string }
 
-/** Type-ahead place suggestions (Photon, built for autocomplete on OpenStreetMap data). */
+/** Type-ahead place suggestions (Photon, built for autocomplete on OpenStreetMap data). Nearby matches first. */
 export async function suggestPlaces(q: string, bias: LatLng | null, signal?: AbortSignal): Promise<Suggestion[]> {
-  const near = bias ? `&lat=${bias.lat}&lon=${bias.lng}` : ''
-  const r = await fetch(`https://photon.komoot.io/api/?limit=6&q=${encodeURIComponent(q)}${near}`, { signal })
-  if (!r.ok) throw new Error('Suggest failed')
+  const base = `https://photon.komoot.io/api/?limit=6&lang=en&q=${encodeURIComponent(q)}`
+  const get = async (extra: string) => {
+    const r = await fetch(base + extra, { signal })
+    if (!r.ok) throw new Error('Suggest failed')
+    return (await r.json()).features as any[]
+  }
+  // matches within ~130 km of the group first; widen to the whole world only if there are few
+  const d = 1.2
+  let features = bias ? await get(`&bbox=${bias.lng - d},${bias.lat - d},${bias.lng + d},${bias.lat + d}`) : []
+  if (features.length < 4) features = [...features, ...(await get(''))]
   const seen = new Set<string>()
-  return ((await r.json()).features as any[]).flatMap(f => {
+  return features.flatMap(f => {
     const p = f.properties
     const title: string = p.name ?? p.street ?? p.city
     if (!title) return []
     const subtitle = [p.street && p.street !== title ? p.street : null, p.district, p.city !== title ? p.city : null, p.state, p.country]
       .filter(Boolean).join(', ')
-    const key = title + subtitle
+    const key = `${p.osm_type}${p.osm_id}`
     if (seen.has(key)) return []
     seen.add(key)
-    return [{ id: `${p.osm_type}${p.osm_id}`, title, subtitle, lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0] }]
-  })
+    return [{ id: key, title, subtitle, lat: f.geometry.coordinates[1], lng: f.geometry.coordinates[0] }]
+  }).slice(0, 7)
+}
+
+/** A short human label for a point ("Marathahalli, Bengaluru"), via Photon reverse geocoding. */
+export async function nameForPoint(c: LatLng, signal?: AbortSignal): Promise<string> {
+  const r = await fetch(`https://photon.komoot.io/reverse?lat=${c.lat}&lon=${c.lng}&lang=en`, { signal })
+  if (!r.ok) throw new Error('Reverse failed')
+  const p = (await r.json()).features?.[0]?.properties
+  if (!p) return ''
+  return [p.name ?? p.street, p.district ?? p.suburb, p.city].filter((x, i, a) => x && a.indexOf(x) === i).join(', ')
 }

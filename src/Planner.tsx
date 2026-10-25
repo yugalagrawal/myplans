@@ -2,8 +2,11 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import MapView from './MapView'
 import MapShot from './MapShot'
 import { centroid, distanceKm, intersectionZone, pointInPolygon, type LatLng } from './geo'
-import { findPlaces, getRoute, getTimes, searchPlace, suggestPlaces, type Place, type Route, type Suggestion } from './api'
-import { CATS } from './categories'
+import { findPlaces, getRoute, getTimes, nameForPoint, searchPlace, suggestPlaces, type Place, type Route, type Suggestion } from './api'
+import ActivityPicker from './ActivityPicker'
+import PlaceCheck from './PlaceCheck'
+import PlaceShare from './PlaceShare'
+import { CENTRE_CAT, CENTRE_KEY, type Cat } from './categories'
 import {
   COLORS, emptyPlan, etaMinutes, examplePlan, fmtDuration, loadInitial, loadSaved,
   persist, shareUrl, storeSaved, type Plan, type Saved,
@@ -16,20 +19,20 @@ export default function Planner() {
   const [query, setQuery] = useState('')
   const [focus, setFocus] = useState<LatLng | null>(null)
   const [toast, setToast] = useState('')
-  const [collapsed, setCollapsed] = useState(false)
-  const [catKey, setCatKey] = useState<string | null>(null)
+  const [cat, setCat] = useState<Cat | null>(null)
   const [found, setFound] = useState<Place[]>([])
   const [times, setTimes] = useState<(number | null)[][] | null>(null)
   const [pState, setPState] = useState<'idle' | 'loading' | 'ok' | 'empty' | 'error'>('idle')
   const [retry, setRetry] = useState(0)
+  const [near, setNear] = useState('')
   const [selected, setSelected] = useState<Place | null>(null)
+  const [checked, setChecked] = useState<Place | null>(null)
   const [routes, setRoutes] = useState<Record<number, Route | 'err'>>({})
   const [sugg, setSugg] = useState<Suggestion[]>([])
   const [hi, setHi] = useState(-1)
 
   const { people } = plan
   const patch = (p: Partial<Plan>) => setPlan(prev => ({ ...prev, ...p }))
-  const cat = CATS.find(c => c.key === catKey) ?? null
 
   useEffect(() => persist(plan), [plan])
   useEffect(() => {
@@ -41,18 +44,21 @@ export default function Planner() {
   // ---- the meeting zone: where everyone's reach overlaps -------------------------------------
   const peopleKey = people.map(p => `${p.id}:${p.lat.toFixed(4)},${p.lng.toFixed(4)}`).join(';')
   const midpoint = useMemo(() => centroid(people), [peopleKey]) // eslint-disable-line react-hooks/exhaustive-deps
-  const zoneKm = midpoint && people.length > 1 ? Math.max(2, 1.6 * Math.max(...people.map(p => distanceKm(p, midpoint)))) : 0
+  const midKey = midpoint ? `${midpoint.lat.toFixed(5)},${midpoint.lng.toFixed(5)}` : ''
+  const zoneKm = midpoint && people.length > 1 ? Math.max(2, 1.35 * Math.max(...people.map(p => distanceKm(p, midpoint)))) : 0
   const zone = useMemo(
     () => (zoneKm ? intersectionZone(people, zoneKm) : null),
     [peopleKey, zoneKm], // eslint-disable-line react-hooks/exhaustive-deps
   )
 
   // ---- things to do inside the zone ---------------------------------------------------------
-  useEffect(() => { setSelected(null) }, [peopleKey, catKey])
+  useEffect(() => { setSelected(checked) }, [peopleKey, cat?.key]) // eslint-disable-line react-hooks/exhaustive-deps
+  // the fairness check only makes sense for two or more people
+  useEffect(() => { if (people.length < 2 && checked) { setChecked(null); setSelected(null) } }, [people.length]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     setTimes(null)
-    if (!cat || !zone || !midpoint) { setFound([]); setPState('idle'); return }
+    if (!cat || !zone || !midpoint || cat.key === CENTRE_KEY) { setFound([]); setPState('idle'); return }
     let stale = false
     setPState('loading'); setFound([])
     const ctl = new AbortController()
@@ -66,7 +72,7 @@ export default function Planner() {
           minLng: Math.max(Math.min(...zone.map(z => z.lng)), midpoint.lng - cap),
           maxLng: Math.min(Math.max(...zone.map(z => z.lng)), midpoint.lng + cap),
         }
-        const raw = await findPlaces(box, cat, ctl.signal)
+        const raw = await findPlaces(box, midpoint, cat, ctl.signal)
         const seen = new Set<string>()
         const withD = raw
           .filter(p => pointInPolygon(p, zone) && !seen.has(p.name + p.lat.toFixed(3)) && seen.add(p.name + p.lat.toFixed(3)))
@@ -83,7 +89,7 @@ export default function Planner() {
     }, 600)
     return () => { stale = true; clearTimeout(t); ctl.abort() }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [catKey, peopleKey, retry])
+  }, [cat?.key, peopleKey, retry])
 
   const tiers = useMemo(() => {
     if (!people.length || !found.length) return []
@@ -107,6 +113,17 @@ export default function Planner() {
   const dimIds = useMemo(() => new Set(tiers.filter(t => t.k < people.length).flatMap(t => t.rows.map(r => r.place.id))), [tiers, people.length])
   const mapPlaces = useMemo(() => found.map(p => ({ ...p, dim: dimIds.has(p.id) })), [found, dimIds])
 
+  // ---- "just the centre point": a readable name for the exact centre -------------------------
+  const isCentre = cat?.key === CENTRE_KEY
+  useEffect(() => {
+    setNear('')
+    if (!isCentre || !midpoint) return
+    const ctl = new AbortController()
+    const t = setTimeout(() => { nameForPoint(midpoint, ctl.signal).then(setNear).catch(() => {}) }, 400)
+    return () => { clearTimeout(t); ctl.abort() }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isCentre, midKey])
+
   // ---- real driving routes to the centre (or the chosen place) -------------------------------
   const target: LatLng | null = selected ?? (midpoint && people.length > 1 ? midpoint : null)
   const routeKey = target ? `${target.lat.toFixed(5)},${target.lng.toFixed(5)}|${peopleKey}` : ''
@@ -127,8 +144,6 @@ export default function Planner() {
 
   const live = people.map(p => (routes[p.id] && routes[p.id] !== 'err' ? (routes[p.id] as Route) : null))
   const etas = target ? people.map((p, i) => live[i]?.min ?? etaMinutes(distanceKm(p, target))) : []
-  const allLive = live.length > 0 && live.every(Boolean)
-  const gap = etas.length ? Math.max(...etas) - Math.min(...etas) : 0
   const routeLines = useMemo(
     () => people.flatMap((p, i) => (live[i] ? [{ id: p.id, color: p.color, line: live[i]!.line }] : [])),
     [routes, peopleKey], // eslint-disable-line react-hooks/exhaustive-deps
@@ -203,34 +218,28 @@ export default function Planner() {
     const next = [{ id: String(Date.now()), savedAt: Date.now(), plan: { ...plan, title } }, ...saved].slice(0, 20)
     setSaved(next); storeSaved(next); patch({ title }); setToast('Saved to your plans')
   }
-  const openSaved = (s: Saved) => { setPlan(s.plan); setFocus(s.plan.people[0] ?? null); setCatKey(null) }
+  async function copyCentre(c: LatLng) {
+    const text = `${c.lat.toFixed(6)}, ${c.lng.toFixed(6)}`
+    try { await navigator.clipboard.writeText(text); setToast('Coordinates copied') } catch { prompt('Copy these coordinates', text) }
+  }
+  const openSaved = (s: Saved) => { setPlan(s.plan); setFocus(s.plan.people[0] ?? null); setCat(null) }
   const deleteSaved = (id: string) => { const n = saved.filter(s => s.id !== id); setSaved(n); storeSaved(n) }
-  const choose = (p: Place) => { setSelected(p); setFocus(p) }
+  const choose = (p: Place) => { setSelected(s => (s?.id === p.id ? null : p)); setFocus(p) }
 
-  const maxEta = etas.length ? Math.max(...etas) : 0
 
   return (
-    <div className="app">
-      <MapView
-        people={people} zone={zone} midpoint={midpoint}
-        target={selected} routeLines={routeLines} places={mapPlaces} placeColor={cat?.color ?? '#ff9f0a'}
-        picking={picking} focus={focus}
-        onPick={p => addPerson(p)} onSelect={choose}
-        onMove={(id, p) => setPlan(prev => ({ ...prev, people: prev.people.map(x => (x.id === id ? { ...x, ...p } : x)) }))}
-      />
-
-      <aside className={collapsed ? 'panel glass collapsed' : 'panel glass'}>
-        <button className="grab" onClick={() => setCollapsed(c => !c)} aria-label="Expand or collapse" />
-        <header>
-          <a className="brand" href="#/"><span className="logo" /> MyPlans</a>
-          <div className="actions">
-            <button className="pill" onClick={savePlan}>Save</button>
-            <button className="pill solid" onClick={share}>Share</button>
-          </div>
-        </header>
-
+    <div className="shell">
+      <header className="bar glass">
+        <a className="brand" href="#/"><span className="logo" /> MyPlans</a>
         <input className="title" value={plan.title} onChange={e => patch({ title: e.target.value })} placeholder="Name your plan" maxLength={60} />
+        <div className="actions">
+          <button className="pill" onClick={savePlan}>Save</button>
+          <button className="pill solid" onClick={share}>Share</button>
+        </div>
+      </header>
+      <div className="work">
 
+      <aside className="side">
         {people.length === 0 && (
           <div className="intro">
             <h2>Where is everyone starting from?</h2>
@@ -239,7 +248,7 @@ export default function Planner() {
           </div>
         )}
 
-        <div className="cap">Who’s coming</div>
+        <div className="cap"><span className="n">1</span> Who’s coming</div>
         <div className="group">
           {people.map((p, i) => (
             <div className="item" key={p.id}>
@@ -279,32 +288,38 @@ export default function Planner() {
 
         {people.length === 1 && <p className="hint">Add one more person to see your meeting zone.</p>}
 
+        {people.length > 1 && (
+          <PlaceCheck
+            people={people} midpoint={midpoint} zone={zone} checked={checked}
+            onCheck={p => { setChecked(p); setSelected(p); if (p) setFocus(p) }}
+          />
+        )}
+
         {zone && target && (
           <>
-            <div className="cap">Meeting zone</div>
-            <div className="zone">
-              <div className="zone-dot" />
-              <div>
-                <b>{selected ? selected.name : 'The middle of the zone'}</b>
-                <span>
-                  {allLive
-                    ? maxEta <= 1 ? 'Everyone is right there' : `Everyone is within ${fmtDuration(maxEta)} by car${gap > 4 ? ` · ${fmtDuration(gap)} difference` : ' · a very even split'}`
-                    : 'Finding drive times…'}
-                </span>
+            <div className="cap">
+              <span className="n">2</span> What do you want to do here?
+              <button className={isCentre ? 'link small on' : 'link small'} onClick={() => setCat(isCentre ? null : CENTRE_CAT)}>
+                📍 Just the centre point
+              </button>
+            </div>
+            <ActivityPicker value={cat} onChange={setCat} />
+
+            {isCentre && midpoint && (
+              <div className="group centre">
+                <div className="item">
+                  <span className="ico sm" style={{ background: '#0a84ff' }}>📍</span>
+                  <span className="grow">
+                    <b>{midpoint.lat.toFixed(6)}, {midpoint.lng.toFixed(6)}</b>
+                    <small>{near ? `Near ${near}` : 'Exact centre of everyone'}</small>
+                  </span>
+                </div>
+                <div className="item">
+                  <button className="pill" onClick={() => copyCentre(midpoint)}>Copy coordinates</button>
+                  <a className="pill" target="_blank" rel="noreferrer" href={`https://www.google.com/maps?q=${midpoint.lat},${midpoint.lng}`}>Open in Maps</a>
+                </div>
               </div>
-              {selected && <button className="link" onClick={() => setSelected(null)}>Reset</button>}
-            </div>
-
-            <div className="cap">What do you want to do here?</div>
-            <div className="cats">
-              {CATS.map(c => (
-                <button key={c.key} className={c.key === catKey ? 'cat on' : 'cat'} onClick={() => setCatKey(k => (k === c.key ? null : c.key))}>
-                  <span className="ico" style={{ background: c.color }}>{c.emoji}</span>
-                  {c.label}
-                </button>
-              ))}
-            </div>
-
+            )}
             {cat && (pState === 'loading' || pState === 'error' || pState === 'empty') && (
               <div className="group results">
                 {pState === 'loading' && <div className="skeleton"><i /><i /><i /></div>}
@@ -312,7 +327,8 @@ export default function Planner() {
                 {pState === 'empty' && <div className="note">No {cat.label.toLowerCase()} found inside the zone. Try another idea or move a pin.</div>}
               </div>
             )}
-            {cat && tiers.map(t => (
+            {cat && tiers.length > 0 && <>
+            {tiers.map(t => (
               <section key={t.k} className="tier">
                 <div className="tier-h">
                   <b>{t.k === people.length ? 'Fair for everyone' : `Better for ${t.k} of ${people.length}`}</b>
@@ -344,6 +360,7 @@ export default function Planner() {
                 </div>
               </section>
             ))}
+            </>}
             {cat && pState === 'ok' && <p className="hint">Coloured numbers are each person’s drive time, with no live traffic. Tap a card to see everyone’s route.</p>}
           </>
         )}
@@ -365,9 +382,31 @@ export default function Planner() {
         )}
 
         {people.length > 0 && (
-          <button className="link reset" onClick={() => { setPlan(emptyPlan()); setCatKey(null) }}>Start a new plan</button>
+          <button className="link reset" onClick={() => { setPlan(emptyPlan()); setCat(null) }}>Start a new plan</button>
         )}
       </aside>
+      <div className="mapwrap">
+      <MapView
+        people={people} zone={zone} zoneKm={zoneKm} midpoint={midpoint}
+        target={selected} routeLines={routeLines} places={mapPlaces} placeColor={cat?.color ?? '#ff9f0a'}
+        picking={picking} focus={focus}
+        onPick={p => addPerson(p)} onSelect={choose}
+        onMove={(id, p) => setPlan(prev => ({ ...prev, people: prev.people.map(x => (x.id === id ? { ...x, ...p } : x)) }))}
+      />
+        {selected && (
+          <PlaceShare
+            place={selected} people={people} mins={etas} exact={live.every(Boolean)} onToast={setToast}
+            onClose={() => { if (selected.id === 'check') setChecked(null); setSelected(null) }}
+          />
+        )}
+        {zone && (
+          <div className="legend glass">
+            <span><i style={{ background: 'linear-gradient(90deg,#0a84ff,#ff375f)', opacity: .55 }} />Circles show how far each person could go</span>
+            <span><i style={{ background: '#0a84ff' }} />Blue is where everyone overlaps — we search here</span>
+          </div>
+        )}
+      </div>
+      </div>
 
       {toast && <div className="toast glass">{toast}</div>}
     </div>

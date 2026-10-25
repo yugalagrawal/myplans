@@ -5,10 +5,13 @@ export type Saved = { id: string; savedAt: number; plan: Plan }
 
 export const COLORS = ['#0a84ff', '#ff375f', '#30d158', '#ff9f0a', '#bf5af2', '#40c8e0']
 
+// titles that earlier versions generated on their own; they are cleared when an old plan is loaded
+const GENERATED_TITLES = ['Bengaluru weekend plan', 'Bengaluru coffee catch-up']
+
 export const emptyPlan = (): Plan => ({ title: '', people: [] })
 
 export const examplePlan = (): Plan => ({
-  title: 'Bengaluru weekend plan',
+  title: '',
   people: [
     { id: 1, name: 'Koramangala', lat: 12.9352, lng: 77.6245, color: COLORS[0] },
     { id: 2, name: 'Indiranagar', lat: 12.9784, lng: 77.6408, color: COLORS[1] },
@@ -39,14 +42,19 @@ export const shareUrl = (p: Plan) => `${location.origin}${location.pathname}#/pl
 
 const valid = (p: any): p is Plan => !!p && Array.isArray(p.people)
 
+const restore = (p: Plan & { auto?: boolean }): Plan => ({
+  title: p.auto || GENERATED_TITLES.includes(p.title) ? '' : p.title ?? '',
+  people: p.people,
+})
+
 export function loadInitial(): Plan {
   try {
     const m = location.hash.match(/[?&]p=([^&]+)/)
-    if (m) { const p = dec(decodeURIComponent(m[1])); if (valid(p)) return { title: p.title ?? '', people: p.people } }
+    if (m) { const p = dec(decodeURIComponent(m[1])); if (valid(p)) return restore(p) }
   } catch { /* fall through */ }
   try {
     const raw = localStorage.getItem(KEY)
-    if (raw) { const p = JSON.parse(raw); if (valid(p)) return { title: p.title ?? '', people: p.people } }
+    if (raw) { const p = JSON.parse(raw); if (valid(p)) return restore(p) }
   } catch { /* ignore */ }
   return emptyPlan()
 }

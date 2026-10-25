@@ -9,6 +9,7 @@ export type Person = LatLng & { id: number; name: string; color: string }
 type Props = {
   people: Person[]
   zone: LatLng[] | null
+  zoneKm: number
   midpoint: LatLng | null
   target: Place | null
   routeLines: { id: number; color: string; line: [number, number][] }[]
@@ -32,11 +33,12 @@ const dot = (cls: string, color: string, label: string) =>
   })
 
 export default function MapView(props: Props) {
-  const { people, zone, midpoint, target, routeLines, places, placeColor, picking, focus } = props
+  const { people, zone, zoneKm, midpoint, target, routeLines, places, placeColor, picking, focus } = props
   const el = useRef<HTMLDivElement>(null)
   const map = useRef<L.Map | null>(null)
   const layer = useRef<L.LayerGroup | null>(null)
   const cb = useRef(props)
+  const refit = useRef<() => void>(() => {})
   cb.current = props
 
   useEffect(() => {
@@ -48,7 +50,9 @@ export default function MapView(props: Props) {
     m.on('click', e => cb.current.picking && cb.current.onPick({ lat: e.latlng.lat, lng: e.latlng.lng }))
     layer.current = L.layerGroup().addTo(m)
     map.current = m
-    return () => { m.remove() }
+    const ro = new ResizeObserver(() => { m.invalidateSize(); refit.current() })
+    ro.observe(el.current!)
+    return () => { ro.disconnect(); m.remove() }
   }, [])
 
   useEffect(() => {
@@ -62,15 +66,13 @@ export default function MapView(props: Props) {
   // Refit when people are added/removed, not while dragging.
   useEffect(() => {
     if (!people.length) return
-    const b = L.latLngBounds(people.map(p => [p.lat, p.lng] as [number, number]))
-    zone?.forEach(z => b.extend([z.lat, z.lng]))
-    const wide = window.innerWidth > 760
-    map.current!.fitBounds(b, {
-      maxZoom: 13,
-      ...(wide
-        ? { paddingTopLeft: [460, 60] as [number, number], paddingBottomRight: [60, 60] as [number, number] }
-        : { paddingTopLeft: [30, 60] as [number, number], paddingBottomRight: [30, window.innerHeight * 0.55] as [number, number] }),
-    })
+    const fit = () => {
+      const b = L.latLngBounds(people.map(p => [p.lat, p.lng] as [number, number]))
+      if (zoneKm) people.forEach(p => b.extend(L.latLng(p).toBounds(zoneKm * 2000)))
+      map.current!.fitBounds(b, { maxZoom: 13, padding: [30, 30], animate: false })
+    }
+    refit.current = fit // also re-run whenever the map's size changes (e.g. the results dock opens)
+    fit()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [people.length, !!zone])
 
@@ -78,15 +80,11 @@ export default function MapView(props: Props) {
     const g = layer.current!
     g.clearLayers()
     if (zone && people.length > 1) {
-      // spotlight: dim everything outside the meeting zone, then outline the zone with a soft glow
-      const dark = window.matchMedia('(prefers-color-scheme: dark)').matches
-      const world: [number, number][] = [[-85, -180], [-85, 180], [85, 180], [85, -180]]
-      const hole = zone.map(z => [z.lat, z.lng] as [number, number])
-      L.polygon([world, hole], {
-        stroke: false, fillColor: dark ? '#000' : '#fff', fillOpacity: dark ? 0.5 : 0.5, interactive: false,
-      }).addTo(g)
-      L.polygon(zone, { color: ACCENT, weight: 12, opacity: 0.16, fill: false, interactive: false, lineJoin: 'round' }).addTo(g)
-      L.polygon(zone, { color: ACCENT, weight: 2.5, fillColor: ACCENT, fillOpacity: 0.1, interactive: false, lineJoin: 'round' }).addTo(g)
+      // one soft circle per person, then the overlap of all of them in blue
+      people.forEach(p =>
+        L.circle(p, { radius: zoneKm * 1000, color: p.color, weight: 2, opacity: 0.85, fillColor: p.color, fillOpacity: 0.1, interactive: false }).addTo(g),
+      )
+      L.polygon(zone, { color: ACCENT, weight: 3, fillColor: ACCENT, fillOpacity: 0.38, interactive: false, lineJoin: 'round' }).addTo(g)
     }
     routeLines.forEach(r => {
       L.polyline(r.line, { color: '#fff', weight: 9, opacity: 0.9, lineCap: 'round', lineJoin: 'round', interactive: false }).addTo(g)
@@ -109,7 +107,7 @@ export default function MapView(props: Props) {
         })
         .addTo(g)
     })
-  }, [people, zone, midpoint, target, routeLines, places, placeColor])
+  }, [people, zone, zoneKm, midpoint, target, routeLines, places, placeColor])
 
   return <div ref={el} className="map" />
 }
